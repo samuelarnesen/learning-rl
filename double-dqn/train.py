@@ -56,8 +56,6 @@ for cycle in range(NUM_CYCLES):
         previous_observation = None
         greedy = episode != NUM_EPISODES_PER_CYCLE - 1
 
-        action_count = [0, 0]
-
         while step_count < MAX_STEPS and not done:
 
             action, _ = model.act(observation=observation, greedy=greedy, epsilon=epsilon)
@@ -97,7 +95,7 @@ for cycle in range(NUM_CYCLES):
                 targets = (rewards + (GAMMA * target_scores)) * live_positions
             else:
                 target_scores = target_model(next_observations)
-                targets = (rewards + (GAMMA * torch.max(target_scores, dism=1).values)) * live_positions
+                targets = (rewards + (GAMMA * torch.max(target_scores, dim=1).values)) * live_positions
 
         with torch.enable_grad():
             estimates = model.evaluate(observations, actions)
