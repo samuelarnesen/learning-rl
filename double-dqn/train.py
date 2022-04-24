@@ -90,7 +90,7 @@ for cycle in range(NUM_CYCLES):
 
         with torch.no_grad():
             if USE_DOUBLE:
-                model_actions = model.batch_act(observation=next_observations).unsqfueeze(1)
+                model_actions = model.batch_act(observation=next_observations).unsqueeze(1)
                 target_scores = target_model.evaluate(next_observations, model_actions)
                 targets = (rewards + (GAMMA * target_scores)) * live_positions
             else:
