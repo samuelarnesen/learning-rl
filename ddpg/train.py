@@ -14,127 +14,124 @@ from models import *
 from base_datasets import *
 from stats_collector import StatsCollector
 
-MAX_LOG_SIZE = 10_000_000
-NUM_ROLLOUTS_PER_EPOCH = 300
-NUM_UPDATES_PER_EPOCH = 2000
-BATCH_SIZE = 128
-INPUT_SIZE = 3
+ENV_NAME = 'MountainCarContinuous-v0'
+#ENV_NAME = "Pendulum-v1" 
+
+MAX_LOG_SIZE = 1_000_000
+BATCH_SIZE = 64
+INPUT_SIZE = 3 if ENV_NAME == "Pendulum-v1" else 2
 GAMMA = 0.99
-NUM_EPOCHS = 1_000_000
+NUM_EPOCHS = 1_000
 ACTOR_FILEPATH = "actor.p"
 CRITIC_FILEPATH = "critic.p"
-MAX_STEPS = 200
-MAX_ACTION = 2.0
-MIN_ACTION = -2.0
-SOFT_UPDATE_RATE = 0.05
+DATA_FILEPATH = "data.p"
+MAX_STEPS = 200 if ENV_NAME == "Pendulum-v1" else 999
+MAX_ACTION = 2.0 if ENV_NAME == "Pendulum-v1" else 1.0
+MIN_ACTION = -2.0 if ENV_NAME == "Pendulum-v1" else -1.0
+MAX_DIST = 2 if ENV_NAME == "Pendulum-v1" else 1
+SOFT_UPDATE_RATE = 0.01
+PRINT_FREQUENCY = 5
+START_NOISE_WEIGHT = 0.00
 
-RELOAD = False
+RELOAD_MODEL = False
+RELOAD_DATA = False
+USE_SOFT_UPDATE = True
+SAVE_DATA = True
+USE_PRIORITY = True
 
-env = gym.make('Pendulum-v1')
+actor = load_model(ACTOR_FILEPATH) if RELOAD_MODEL else ActorNetwork(input_size=INPUT_SIZE, max_dist=MAX_DIST)
+critic = load_model(CRITIC_FILEPATH) if RELOAD_MODEL else CriticNetwork(input_size=INPUT_SIZE)
 
-actor = load_model(ACTOR_FILEPATH) if RELOAD else ActorNetwork(input_size=INPUT_SIZE)
-critic = load_model(CRITIC_FILEPATH) if RELOAD else CriticNetwork(input_size=INPUT_SIZE)
+env = gym.make(ENV_NAME)
 
 save_model(critic, CRITIC_FILEPATH)
 save_model(actor, ACTOR_FILEPATH)
 target_actor = load_model(ACTOR_FILEPATH)
 target_critic = load_model(CRITIC_FILEPATH)
 
-dataset = SimpleLog(max_size=MAX_LOG_SIZE)
+dataset = load_dataset(DATA_FILEPATH, MAX_LOG_SIZE, USE_PRIORITY) if RELOAD_DATA else (PriorityLog(max_size=MAX_LOG_SIZE) if USE_PRIORITY else SimpleLog(max_size=MAX_LOG_SIZE))
 
 actor_optimizer = optim.AdamW(actor.parameters(), lr=10e-6)
-critic_optimizer = optim.AdamW(critic.parameters(), lr=10e-4)
-loss_func = nn.MSELoss()
+critic_optimizer = optim.AdamW(critic.parameters(), lr=10e-5)
+loss_func = nn.MSELoss(reduction='none')
 
-update_stats_collector = StatsCollector()
-rollout_stats_collector = StatsCollector()
-
-def flip_observation(ob):
-	new_ob = copy.deepcopy(ob)
-	new_ob[1] = ob[1]
-	return new_ob
-
-# ======================= ROLL-OUT ========================== #
+stats_collector = StatsCollector()
 
 for epoch in range(NUM_EPOCHS):
 
-	for rollout in range(NUM_ROLLOUTS_PER_EPOCH):
+	observation = env.reset()
+	total_reward = 0
+	done = False
+	steps = 0
 
-		observation = env.reset()
-		total_reward = 0
-		done = False
-		steps = 0
+	noise_to_use = max(START_NOISE_WEIGHT - (START_NOISE_WEIGHT * epoch * 2 / NUM_EPOCHS), 0)
+	actor.start_episode()
+	actor.set_noise_weight(noise_to_use)
 
-		while not done:
+	while not done:
 
-			with torch.no_grad():
-				action = actor(observation).item()
+		with torch.no_grad():
+			actor.eval()
+			action = actor(observation).item()
+			actor.train()
 
-			old_observation = observation
-			normalized_action = max(min(action, MAX_ACTION), MIN_ACTION)
-			observation, reward, done, info = env.step(np.asarray([normalized_action]))
+		old_observation = observation
+		normalized_action = max(min(action, MAX_ACTION), MIN_ACTION)
+		observation, reward, done, info = env.step(np.asarray([normalized_action]))
+		steps += 1
 
-			dataset.add(old_observation, observation, normalized_action, reward)
-			#dataset.add(flip_observation(old_observation), flip_observation(observation), normalized_action * -1, reward) # augments data
+		dataset.add(old_observation, observation, normalized_action, reward, done)
 
-			total_reward += reward
+		if (done and steps < MAX_STEPS):
+			print("success!", steps, reward)
 
-		rollout_stats_collector.add({"Reward": total_reward})
+		if len(dataset) < (BATCH_SIZE * 3):
+			continue
 
-	rollout_stats_collector.show()
-	rollout_stats_collector.reset()
-		
-	for i in range(NUM_UPDATES_PER_EPOCH):
-
-		current_observation_batch, next_observation_batch, action_batch, rewards_batch = dataset.sample_batch(BATCH_SIZE)
+		current_observation_batch, next_observation_batch, action_batch, rewards_batch, incompletions = dataset.sample_batch(BATCH_SIZE)
 
 		with torch.no_grad():
 			next_actions_batch = target_actor(next_observation_batch, include_noise=False)
 			evaluations = target_critic(next_observation_batch, next_actions_batch)
-			targets = rewards_batch.float() + (GAMMA * evaluations.squeeze())
+			targets = rewards_batch.float() + (GAMMA * evaluations.squeeze() * incompletions.squeeze())
 
 		outputs = critic(current_observation_batch, action_batch).squeeze()
-		loss = loss_func(outputs, targets)
+		raw_loss = loss_func(outputs, targets)
+		loss = torch.mean(raw_loss)
 		loss.backward()
 		critic_optimizer.step()
 		critic_optimizer.zero_grad()
 
-		current_actions = actor(current_observation_batch)
-		raw_value = -1 * (rewards_batch + critic(current_observation_batch, current_actions).squeeze())
+		current_actions = actor(current_observation_batch, include_noise=False)
+		raw_value = -1 * critic(current_observation_batch, current_actions).squeeze()
 		value = torch.mean(raw_value)
 		value.backward()
 		actor_optimizer.step()
 		actor_optimizer.zero_grad()
 
-		update_stats_collector.add({"Critic Loss": loss.item(), "Actor Loss": value.item()})
+		stats_collector.add({"Reward": reward, "Critic Loss": loss.item(), "Actor Loss": value.item(), "Noise": actor.get_noise_weight()})
 
-		soft_update(critic, target_critic, SOFT_UPDATE_RATE)
-		soft_update(actor, target_actor, SOFT_UPDATE_RATE)
+		if USE_SOFT_UPDATE:
+			soft_update(critic, target_critic, SOFT_UPDATE_RATE)
+			soft_update(actor, target_actor, SOFT_UPDATE_RATE)
 
+		dataset.record_results(raw_loss)
 
-	update_stats_collector.show()
-	update_stats_collector.reset()
+	if (epoch % PRINT_FREQUENCY == 0) or epoch == NUM_EPOCHS - 1:
+		stats_collector.show()
+		stats_collector.reset()
 
 	save_model(critic, CRITIC_FILEPATH)
 	save_model(actor, ACTOR_FILEPATH)
-	print("Noise:", actor.get_noise_weight())
+	save_model(target_actor, "target-actor.p")
+	save_model(target_critic, "target-critic.p")
 
+	if not USE_SOFT_UPDATE:
+		target_actor = load_model(ACTOR_FILEPATH)
+		target_critic = load_model(CRITIC_FILEPATH)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+	if SAVE_DATA:
+		save_dataset(DATA_FILEPATH, dataset)
 
 
 
